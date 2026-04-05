@@ -11,6 +11,12 @@ export interface ProPresenterStatus {
   protocol: 'http' | 'https'
 }
 
+export interface ProPresenterDiscoveredHost {
+  host: string
+  port: number
+  protocol: 'http' | 'https'
+}
+
 export interface ActivePresentation {
   id: { uuid: string; name: string; index: number }
   presentationCurrentSlide: number
@@ -203,6 +209,202 @@ class ProPresenterService {
     return `${this._protocol}://${this._host}:${this._port}`
   }
 
+  private normalizeHostCandidate(value: string): string | null {
+    const normalized = value
+      .trim()
+      .replace(/^https?:\/\//i, '')
+      .replace(/\/.*$/, '')
+      .replace(/:\d+$/, '')
+
+    if (!normalized) return null
+
+    const lower = normalized.toLowerCase()
+    if (lower === '0.0.0.0' || lower === '::') return null
+
+    return normalized
+  }
+
+  private buildSubnetCandidates(host: string): string[] {
+    const normalizedHost = this.normalizeHostCandidate(host)
+    if (!normalizedHost) return []
+
+    const match = normalizedHost.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+    if (!match) return []
+
+    const octets = match.slice(1).map((value) => Number(value))
+    if (octets.some((octet) => octet < 0 || octet > 255)) return []
+
+    const subnetPrefix = `${octets[0]}.${octets[1]}.${octets[2]}`
+    const hostOctet = octets[3]
+    const candidates: string[] = []
+
+    for (let value = 1; value <= 254; value += 1) {
+      if (value === hostOctet) continue
+      candidates.push(`${subnetPrefix}.${value}`)
+    }
+
+    return candidates
+  }
+
+  private buildHostScanCandidates(seedHosts: string[]): string[] {
+    const normalizedSeeds = seedHosts
+      .map((value) => this.normalizeHostCandidate(value))
+      .filter((value): value is string => Boolean(value))
+
+    if (typeof window !== 'undefined') {
+      const browserHost = this.normalizeHostCandidate(window.location.hostname)
+      if (browserHost) {
+        normalizedSeeds.unshift(browserHost)
+      }
+    }
+
+    const subnetCandidates = normalizedSeeds.flatMap((host) =>
+      this.buildSubnetCandidates(host),
+    )
+
+    const fallbackSubnetCandidates: string[] = []
+    if (subnetCandidates.length === 0) {
+      const fallbackPrefixes = ['192.168.0', '192.168.1', '10.0.0']
+
+      fallbackPrefixes.forEach((prefix) => {
+        for (let value = 2; value <= 60; value += 1) {
+          fallbackSubnetCandidates.push(`${prefix}.${value}`)
+        }
+      })
+    }
+
+    const orderedCandidates = [
+      'localhost',
+      '127.0.0.1',
+      ...normalizedSeeds,
+      ...subnetCandidates,
+      ...fallbackSubnetCandidates,
+    ]
+
+    const deduped: string[] = []
+    const seen = new Set<string>()
+
+    for (const candidate of orderedCandidates) {
+      const normalized = this.normalizeHostCandidate(candidate)
+      if (!normalized) continue
+
+      const key = normalized.toLowerCase()
+      if (seen.has(key)) continue
+
+      seen.add(key)
+      deduped.push(normalized)
+
+      if (deduped.length >= 280) {
+        break
+      }
+    }
+
+    return deduped
+  }
+
+  private async probeVersionAtHost(
+    host: string,
+    port: number,
+    protocol: 'http' | 'https',
+    timeoutMs: number,
+  ): Promise<boolean> {
+    const targetPaths: Array<'/version' | '/v1/version'> = [
+      '/version',
+      '/v1/version',
+    ]
+
+    for (const path of targetPaths) {
+      try {
+        const response = await fetch(`${protocol}://${host}:${port}${path}`, {
+          signal: AbortSignal.timeout(timeoutMs),
+        })
+
+        if (response.ok) {
+          return true
+        }
+      } catch {
+        // Ignore failed probes while scanning.
+      }
+    }
+
+    return false
+  }
+
+  async scanAvailableHosts(options?: {
+    protocol?: 'http' | 'https'
+    port?: number
+    seedHosts?: string[]
+    maxResults?: number
+    timeoutMs?: number
+  }): Promise<ProPresenterDiscoveredHost[]> {
+    const protocol = options?.protocol ?? this._protocol
+    const portCandidate =
+      typeof options?.port === 'number' && Number.isFinite(options.port)
+        ? Math.max(Math.floor(options.port), 1)
+        : this._port
+    const port = Math.min(portCandidate, 65535)
+    const maxResultsCandidate =
+      typeof options?.maxResults === 'number' && Number.isFinite(options.maxResults)
+        ? Math.max(Math.floor(options.maxResults), 1)
+        : 8
+    const maxResults = Math.min(maxResultsCandidate, 20)
+    const timeoutMsCandidate =
+      typeof options?.timeoutMs === 'number' && Number.isFinite(options.timeoutMs)
+        ? Math.max(Math.floor(options.timeoutMs), 300)
+        : 900
+    const timeoutMs = Math.min(timeoutMsCandidate, 5000)
+
+    const candidates = this.buildHostScanCandidates([
+      this._host,
+      ...(options?.seedHosts ?? []),
+    ])
+
+    if (candidates.length === 0) return []
+
+    let cursor = 0
+    const workerCount = Math.min(24, candidates.length)
+    const discovered: Array<{ host: string; index: number }> = []
+    const discoveredSet = new Set<string>()
+
+    const worker = async () => {
+      while (true) {
+        if (discovered.length >= maxResults) return
+
+        const candidateIndex = cursor
+        cursor += 1
+
+        if (candidateIndex >= candidates.length) return
+
+        const candidateHost = candidates[candidateIndex]
+        const isAvailable = await this.probeVersionAtHost(
+          candidateHost,
+          port,
+          protocol,
+          timeoutMs,
+        )
+
+        if (!isAvailable) continue
+
+        const dedupeKey = candidateHost.toLowerCase()
+        if (discoveredSet.has(dedupeKey)) continue
+
+        discoveredSet.add(dedupeKey)
+        discovered.push({ host: candidateHost, index: candidateIndex })
+      }
+    }
+
+    await Promise.all(Array.from({ length: workerCount }, () => worker()))
+
+    return discovered
+      .sort((a, b) => a.index - b.index)
+      .slice(0, maxResults)
+      .map((entry) => ({
+        host: entry.host,
+        port,
+        protocol,
+      }))
+  }
+
   private async request<T>(
     path: string,
     method = 'GET',
@@ -274,7 +476,7 @@ class ProPresenterService {
     host: string,
     port: number,
     protocol: 'http' | 'https' = 'http',
-  ) {
+  ): Promise<{ success: true; port: number } | { success: false }> {
     const normalizedHost =
       host.trim().replace(/^https?:\/\//i, '').replace(/\/$/, '') ||
       'localhost'
@@ -1138,10 +1340,9 @@ class ProPresenterService {
           this.normalizeText(playlist.id.name) || 'Playlist',
         )
 
-        return items
-          .map((entry) => {
+        return items.flatMap((entry): PlaylistPresentation[] => {
             const itemIdentifier = this.parsePlaylistItemIdentifier(entry)
-            if (!itemIdentifier) return null
+            if (!itemIdentifier) return []
 
             const parsedItemIndex = this.parsePlaylistItemIndex(entry)
 
@@ -1154,7 +1355,7 @@ class ProPresenterService {
               normalizedItem.index = parsedItemIndex
             }
 
-            if (!normalizedItem.uuid) return null
+            if (!normalizedItem.uuid) return []
 
             const presentationIdentifier =
               this.parsePlaylistPresentationIdentifier(entry)
@@ -1165,14 +1366,18 @@ class ProPresenterService {
                 )
               : undefined
 
-            return {
+            const playlistPresentation: PlaylistPresentation = {
               playlist: normalizedPlaylist,
               item: normalizedItem,
               itemType: this.normalizeText(entry.type) || 'presentation',
-              presentation: normalizedPresentation,
             }
+
+            if (normalizedPresentation) {
+              playlistPresentation.presentation = normalizedPresentation
+            }
+
+            return [playlistPresentation]
           })
-          .filter((entry): entry is PlaylistPresentation => entry !== null)
       }),
     )
 

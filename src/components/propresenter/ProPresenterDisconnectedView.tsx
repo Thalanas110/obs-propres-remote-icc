@@ -1,4 +1,5 @@
-import { Lock, Presentation, RefreshCw, Wifi, WifiOff } from 'lucide-react'
+import type { ProPresenterDiscoveredHost } from '@/services/propresenter.service'
+import { Lock, Presentation, RefreshCw, Server, Wifi, WifiOff } from 'lucide-react'
 
 interface ProPresenterDisconnectedViewProps {
   protocol: 'http' | 'https'
@@ -6,11 +7,17 @@ interface ProPresenterDisconnectedViewProps {
   port: number
   normalizedHost: string
   connecting: boolean
+  scanningNetwork: boolean
+  scanResults: ProPresenterDiscoveredHost[]
+  scanAttempts: number
   connError: string | null
+  scanError: string | null
   onProtocolChange: (protocol: 'http' | 'https') => void
   onHostChange: (value: string) => void
   onPortChange: (value: number) => void
   onConnect: () => void
+  onScanNetwork: () => void
+  onConnectToDiscoveredHost: (candidate: ProPresenterDiscoveredHost) => void
 }
 
 export function ProPresenterDisconnectedView({
@@ -19,11 +26,17 @@ export function ProPresenterDisconnectedView({
   port,
   normalizedHost,
   connecting,
+  scanningNetwork,
+  scanResults,
+  scanAttempts,
   connError,
+  scanError,
   onProtocolChange,
   onHostChange,
   onPortChange,
   onConnect,
+  onScanNetwork,
+  onConnectToDiscoveredHost,
 }: ProPresenterDisconnectedViewProps) {
   return (
     <div className="pp-panel h-full flex flex-col">
@@ -96,6 +109,62 @@ export function ProPresenterDisconnectedView({
           {connError && (
             <p className="text-xs text-red-400 text-center">{connError}</p>
           )}
+
+          <div className="space-y-2 rounded-md border border-neutral-800 bg-neutral-900/40 p-3">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-medium uppercase tracking-wide text-neutral-500">
+                Network Scan
+              </span>
+              <button
+                className="connect-btn px-2.5 py-1.5 text-[11px]"
+                onClick={onScanNetwork}
+                disabled={connecting || scanningNetwork}
+              >
+                {scanningNetwork ? (
+                  <RefreshCw size={12} className="animate-spin" />
+                ) : (
+                  <Server size={12} />
+                )}
+                {scanningNetwork ? 'Scanning...' : 'Scan Network'}
+              </button>
+            </div>
+
+            {scanningNetwork && (
+              <p className="text-xs text-neutral-400">
+                Scanning local network for available PCs...
+              </p>
+            )}
+
+            {!scanningNetwork && scanAttempts > 0 && scanResults.length === 0 && !scanError && (
+              <p className="text-xs text-neutral-500">
+                No available PCs were found on this network.
+              </p>
+            )}
+
+            {scanError && <p className="text-xs text-red-400">{scanError}</p>}
+
+            {scanResults.length > 0 && (
+              <div className="max-h-32 space-y-1 overflow-y-auto pr-1">
+                {scanResults.map((candidate) => {
+                  const candidateKey = `${candidate.protocol}://${candidate.host}:${candidate.port}`
+
+                  return (
+                    <button
+                      key={candidateKey}
+                      className="flex w-full items-center justify-between gap-2 rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-left text-xs transition-colors hover:border-violet-500/40 hover:bg-violet-500/10"
+                      onClick={() => onConnectToDiscoveredHost(candidate)}
+                      disabled={connecting}
+                    >
+                      <span className="font-mono text-neutral-300">
+                        {candidateKey}
+                      </span>
+                      <span className="text-[11px] text-violet-300">Connect</span>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </div>
 
           <button
             className="connect-btn w-full"

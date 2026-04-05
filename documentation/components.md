@@ -112,6 +112,8 @@ Polling pattern:
   - Online badge, loading spinner, disconnect button.
 - `ProPresenterDisconnectedView.tsx`
   - Host/port/protocol inputs and connect action.
+  - Automatic network scan for reachable ProPresenter hosts.
+  - Displays both discovered PCs and explicit "none found" state.
 - `ProPresenterActivePresentationCard.tsx`
   - Active presentation summary, slide progress bar, presentation source selectors, trigger action.
 - `ProPresenterTabBar.tsx`

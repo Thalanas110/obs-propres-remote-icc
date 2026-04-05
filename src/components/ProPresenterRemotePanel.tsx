@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   proPresenterService,
   type ActivePresentationSlide,
+  type ProPresenterDiscoveredHost,
   type LibraryPresentation,
   type Macro,
   type PlaylistPresentation,
@@ -47,6 +48,12 @@ export function ProPresenterRemotePanel() {
   const [port, setPort] = useState(50001)
   const [connecting, setConnecting] = useState(false)
   const [connError, setConnError] = useState<string | null>(null)
+  const [scanningNetwork, setScanningNetwork] = useState(false)
+  const [scanAttempts, setScanAttempts] = useState(0)
+  const [scanResults, setScanResults] = useState<ProPresenterDiscoveredHost[]>(
+    [],
+  )
+  const [scanError, setScanError] = useState<string | null>(null)
 
   const normalizedHost = host
     .trim()
@@ -123,6 +130,53 @@ export function ProPresenterRemotePanel() {
     )
     return unsub
   }, [])
+
+  const runNetworkScan = useCallback(async () => {
+    if (scanningNetwork) return
+
+    setScanningNetwork(true)
+    setConnError(null)
+    setScanError(null)
+
+    try {
+      const results = await proPresenterService.scanAvailableHosts({
+        protocol,
+        port,
+        seedHosts: [normalizedHost || host],
+        maxResults: 8,
+      })
+
+      setScanResults(results)
+
+      if (results.length > 0) {
+        const firstResult = results[0]
+        setHost(firstResult.host)
+        setPort(firstResult.port)
+        setProtocol(firstResult.protocol)
+      }
+    } catch {
+      setScanResults([])
+      setScanError(
+        'Automatic network scan failed. You can still connect manually.',
+      )
+    } finally {
+      setScanAttempts((current) => current + 1)
+      setScanningNetwork(false)
+    }
+  }, [scanningNetwork, protocol, port, normalizedHost, host])
+
+  useEffect(() => {
+    if (status.connected) {
+      setScanningNetwork(false)
+      setScanAttempts(0)
+      setScanResults([])
+      setScanError(null)
+      return
+    }
+
+    if (scanAttempts > 0) return
+    void runNetworkScan()
+  }, [status.connected, scanAttempts, runNetworkScan])
 
   const fetchStatus = useCallback(async () => {
     if (!proPresenterService.status.connected) return
@@ -406,16 +460,29 @@ export function ProPresenterRemotePanel() {
     })()
   }
 
-  const handleConnect = async () => {
+  const handleConnect = async (target?: ProPresenterDiscoveredHost) => {
+    const targetHost = target?.host?.trim() || normalizedHost || host
+    const targetPort =
+      typeof target?.port === 'number' && Number.isFinite(target.port)
+        ? target.port
+        : port
+    const targetProtocol = target?.protocol ?? protocol
+
+    setHost(targetHost)
+    setPort(targetPort)
+    setProtocol(targetProtocol)
+
     setConnecting(true)
     setConnError(null)
     const result = await proPresenterService.connect(
-      normalizedHost || host,
-      port,
-      protocol,
+      targetHost,
+      targetPort,
+      targetProtocol,
     )
 
-    if (!result.success) {
+    if (result.success && typeof result.port === 'number') {
+      setPort(result.port)
+    } else {
       setConnError(
         'Could not reach ProPresenter. Check host/port and ensure the API is enabled.',
       )
@@ -512,12 +579,22 @@ export function ProPresenterRemotePanel() {
         port={port}
         normalizedHost={normalizedHost}
         connecting={connecting}
+        scanningNetwork={scanningNetwork}
+        scanResults={scanResults}
+        scanAttempts={scanAttempts}
         connError={connError}
+        scanError={scanError}
         onProtocolChange={setProtocol}
         onHostChange={setHost}
         onPortChange={setPort}
         onConnect={() => {
           void handleConnect()
+        }}
+        onScanNetwork={() => {
+          void runNetworkScan()
+        }}
+        onConnectToDiscoveredHost={(candidate) => {
+          void handleConnect(candidate)
         }}
       />
     )
