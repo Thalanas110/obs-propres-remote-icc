@@ -41,6 +41,12 @@ const getPlaylistItemKey = (item: PlaylistPresentation) => {
   return `${playlistKey}::${itemName || item.item.index}`
 }
 
+const hasSlideData = (presentation: ActivePres | null): presentation is ActivePres =>
+  Boolean(
+    presentation &&
+      (presentation.slides.length > 0 || presentation.totalSlides > 0),
+  )
+
 export function ProPresenterRemotePanel() {
   const [status, setStatus] = useState(proPresenterService.status)
   const [protocol, setProtocol] = useState<'http' | 'https'>('http')
@@ -65,6 +71,9 @@ export function ProPresenterRemotePanel() {
     'playlist' | 'library'
   >('playlist')
   const [activePres, setActivePres] = useState<ActivePres | null>(null)
+  const [stagedPres, setStagedPres] = useState<ActivePres | null>(null)
+  const [lastSlideSelectionPres, setLastSlideSelectionPres] =
+    useState<ActivePres | null>(null)
   const [libraryPresentations, setLibraryPresentations] = useState<
     LibraryPresentation[]
   >([])
@@ -92,6 +101,16 @@ export function ProPresenterRemotePanel() {
     presentationUUID: string
     slideIndex: number
   } | null>(null)
+
+  const displayPres = useMemo(() => {
+    if (stagedPres) return stagedPres
+
+    if (hasSlideData(activePres)) {
+      return activePres
+    }
+
+    return lastSlideSelectionPres ?? activePres
+  }, [stagedPres, activePres, lastSlideSelectionPres])
 
   const applyManualSlideOverride = useCallback(
     (presentationUUID: string, requestedSlideIndex: number) => {
@@ -130,6 +149,37 @@ export function ProPresenterRemotePanel() {
     )
     return unsub
   }, [])
+
+  useEffect(() => {
+    if (!hasSlideData(activePres)) return
+
+    setLastSlideSelectionPres((current) => {
+      const isSamePresentation = current?.uuid === activePres.uuid
+      const currentHasSlides =
+        current !== null &&
+        (current.slides.length > 0 || current.totalSlides > 0)
+      const nextHasSlides =
+        activePres.slides.length > 0 || activePres.totalSlides > 0
+
+      if (!nextHasSlides) return current
+      if (!currentHasSlides) return activePres
+
+      if (isSamePresentation) {
+        return {
+          ...current,
+          ...activePres,
+        }
+      }
+
+      return activePres
+    })
+  }, [activePres])
+
+  useEffect(() => {
+    if (!hasSlideData(stagedPres)) return
+
+    setLastSlideSelectionPres(stagedPres)
+  }, [stagedPres])
 
   const runNetworkScan = useCallback(async () => {
     if (scanningNetwork) return
@@ -218,16 +268,50 @@ export function ProPresenterRemotePanel() {
           manualSlideOverrideRef.current = null
         }
 
-        setActivePres({
+        const nextActivePres: ActivePres = {
           name: pres.id?.name ?? 'Unknown',
           currentSlide: resolvedCurrentSlide,
           totalSlides: pres.presentationSlideCount ?? 0,
           uuid: pres.id?.uuid ?? '',
           slides: pres.slides ?? [],
           statusCurrentSlideUUID: pres.statusCurrentSlideUUID,
+        }
+
+        setActivePres((current) => {
+          const incomingHasSlideData =
+            nextActivePres.slides.length > 0 || nextActivePres.totalSlides > 0
+
+          if (!current || incomingHasSlideData) {
+            return nextActivePres
+          }
+
+          const currentHasSlideData =
+            current.slides.length > 0 || current.totalSlides > 0
+
+          if (!currentHasSlideData) {
+            return nextActivePres
+          }
+
+          const maxSlideIndex =
+            current.totalSlides > 0 ? current.totalSlides - 1 : Number.MAX_SAFE_INTEGER
+          const normalizedCurrentSlide =
+            maxSlideIndex === Number.MAX_SAFE_INTEGER
+              ? Math.max(nextActivePres.currentSlide, 0)
+              : Math.min(Math.max(nextActivePres.currentSlide, 0), maxSlideIndex)
+
+          return {
+            ...current,
+            currentSlide: normalizedCurrentSlide,
+            statusCurrentSlideUUID:
+              nextActivePres.statusCurrentSlideUUID ||
+              current.statusCurrentSlideUUID,
+            name:
+              nextActivePres.name && nextActivePres.name !== 'Unknown'
+                ? nextActivePres.name
+                : current.name,
+            uuid: nextActivePres.uuid || current.uuid,
+          }
         })
-      } else {
-        setActivePres(null)
       }
 
       setMacros(macroList)
@@ -263,6 +347,7 @@ export function ProPresenterRemotePanel() {
       setSelectedPlaylistKey('')
       setSelectedPlaylistItemKey('')
       setPresentationError(null)
+      setStagedPres(null)
       manualSlideOverrideRef.current = null
       return
     }
@@ -286,7 +371,7 @@ export function ProPresenterRemotePanel() {
 
   useEffect(() => {
     setHiddenSlideThumbnails({})
-  }, [activePres?.uuid])
+  }, [displayPres?.uuid])
 
   const playlistOptions = useMemo(() => {
     const options = new Map<string, { value: string; label: string }>()
@@ -413,7 +498,7 @@ export function ProPresenterRemotePanel() {
   }, [libraryPresentations, activePres?.uuid])
 
   const triggerSlideByIndex = (slideIndex: number) => {
-    const presentationUUID = activePres?.uuid
+    const presentationUUID = displayPres?.uuid
     if (!presentationUUID) return
 
     void (async () => {
@@ -423,6 +508,7 @@ export function ProPresenterRemotePanel() {
       )
 
       if (triggered) {
+        setStagedPres(null)
         applyManualSlideOverride(presentationUUID, slideIndex)
       }
 
@@ -431,14 +517,20 @@ export function ProPresenterRemotePanel() {
   }
 
   const handlePreviousSlide = () => {
-    const presentationUUID = activePres?.uuid
+    const presentationUUID = displayPres?.uuid
     if (!presentationUUID) return
 
     void (async () => {
-      const triggered = await proPresenterService.triggerPreviousSlide()
+      const currentSlide = displayPres?.currentSlide ?? -1
+      const targetSlide = Math.max(currentSlide - 1, 0)
+      const triggered = await proPresenterService.triggerSlideIndex(
+        presentationUUID,
+        targetSlide,
+      )
 
       if (triggered) {
-        applyManualSlideOverride(presentationUUID, (activePres?.currentSlide ?? 0) - 1)
+        setStagedPres(null)
+        applyManualSlideOverride(presentationUUID, targetSlide)
       }
 
       await fetchStatus()
@@ -446,16 +538,29 @@ export function ProPresenterRemotePanel() {
   }
 
   const handleNextSlide = () => {
-    const presentationUUID = activePres?.uuid
+    const presentationUUID = displayPres?.uuid
     if (!presentationUUID) return
 
     void (async () => {
-      const triggered = await proPresenterService.triggerNextSlide()
+      const currentSlide = displayPres?.currentSlide ?? -1
+      const targetSlide = Math.max(currentSlide + 1, 0)
+      const triggered = await proPresenterService.triggerSlideIndex(
+        presentationUUID,
+        targetSlide,
+      )
 
       if (triggered) {
-        applyManualSlideOverride(presentationUUID, (activePres?.currentSlide ?? 0) + 1)
+        setStagedPres(null)
+        applyManualSlideOverride(presentationUUID, targetSlide)
       }
 
+      await fetchStatus()
+    })()
+  }
+
+  const handleTriggerMacro = (macroUUID: string) => {
+    void (async () => {
+      await proPresenterService.triggerMacro(macroUUID)
       await fetchStatus()
     })()
   }
@@ -499,6 +604,7 @@ export function ProPresenterRemotePanel() {
 
     try {
       let success = false
+      let targetPresentationUUID = ''
 
       if (presentationSource === 'playlist') {
         if (!selectedPlaylistKey) {
@@ -520,11 +626,43 @@ export function ProPresenterRemotePanel() {
           selectedItem.playlist.name ||
           `${selectedItem.playlist.index}`
 
-        success = await proPresenterService.triggerPlaylistItem(
-          playlistTarget,
-          selectedItem.item.uuid,
-          selectedItem.item.index,
-        )
+        targetPresentationUUID = selectedItem.presentation?.uuid?.trim() ?? ''
+
+        if (!targetPresentationUUID) {
+          const triggered = await proPresenterService.triggerPlaylistItem(
+            playlistTarget,
+            selectedItem.item.uuid,
+            selectedItem.item.index,
+          )
+
+          if (!triggered) {
+            setPresentationError('Unable to trigger the selected playlist item.')
+            return
+          }
+
+          setStagedPres(null)
+          await fetchStatus()
+          return
+        }
+
+        success = await proPresenterService.focusPresentation(targetPresentationUUID)
+
+        if (!success) {
+          const triggered = await proPresenterService.triggerPlaylistItem(
+            playlistTarget,
+            selectedItem.item.uuid,
+            selectedItem.item.index,
+          )
+
+          if (!triggered) {
+            setPresentationError('Unable to stage or trigger the selected playlist item.')
+            return
+          }
+
+          setStagedPres(null)
+          await fetchStatus()
+          return
+        }
       } else {
         const targetUUID = selectedLibraryPresentationUUID.trim()
         if (!targetUUID) {
@@ -532,16 +670,37 @@ export function ProPresenterRemotePanel() {
           return
         }
 
-        success = await proPresenterService.triggerPresentation(targetUUID)
+        targetPresentationUUID = targetUUID
+        success = await proPresenterService.focusPresentation(targetUUID)
       }
 
       if (!success) {
         setPresentationError(
           presentationSource === 'playlist'
-            ? 'Unable to trigger the selected playlist item.'
-            : 'Unable to trigger the selected library presentation.',
+            ? 'Unable to focus the selected playlist item.'
+            : 'Unable to focus the selected library presentation.',
         )
         return
+      }
+
+      const staged = await proPresenterService.getPresentationByUUID(
+        targetPresentationUUID,
+      )
+
+      if (staged) {
+        setStagedPres({
+          name: staged.id.name,
+          // No cue is live yet; first live cue is explicitly user-triggered.
+          currentSlide: -1,
+          totalSlides: staged.presentationSlideCount,
+          uuid: staged.id.uuid,
+          slides: staged.slides,
+          statusCurrentSlideUUID: undefined,
+        })
+        setActiveTab('slides')
+        setJumpSlide('')
+      } else {
+        setPresentationError('Focused presentation, but slides failed to load.')
       }
 
       await fetchStatus()
@@ -558,11 +717,11 @@ export function ProPresenterRemotePanel() {
     ? selectedPlaylistItemKey
     : selectedLibraryPresentationUUID
 
-  const slidesForGrid: ActivePresentationSlide[] = activePres
-    ? activePres.slides.length > 0
-      ? activePres.slides
-      : Array.from({ length: activePres.totalSlides }, (_, index) => ({
-          uuid: `${activePres.uuid || 'slide'}-${index}`,
+  const slidesForGrid: ActivePresentationSlide[] = displayPres
+    ? displayPres.slides.length > 0
+      ? displayPres.slides
+      : Array.from({ length: displayPres.totalSlides }, (_, index) => ({
+          uuid: `${displayPres.uuid || 'slide'}-${index}`,
           index,
           label: `Slide ${index + 1}`,
           text: '',
@@ -608,7 +767,7 @@ export function ProPresenterRemotePanel() {
       />
 
       <ProPresenterActivePresentationCard
-        activePres={activePres}
+        activePres={displayPres}
         source={presentationSource}
         refreshingPresentationList={refreshingPresentationList}
         switchingPresentation={switchingPresentation}
@@ -621,10 +780,12 @@ export function ProPresenterRemotePanel() {
         presentationError={presentationError}
         onSourceChange={(source) => {
           setPresentationSource(source)
+          setStagedPres(null)
           setPresentationError(null)
         }}
         onPlaylistSelectionChange={(value) => {
           setSelectedPlaylistKey(value)
+          setStagedPres(null)
           setPresentationError(null)
         }}
         onSelectionChange={(value) => {
@@ -633,6 +794,7 @@ export function ProPresenterRemotePanel() {
           } else {
             setSelectedLibraryPresentationUUID(value)
           }
+          setStagedPres(null)
           setPresentationError(null)
         }}
         onTriggerPresentation={() => {
@@ -648,7 +810,7 @@ export function ProPresenterRemotePanel() {
       <div className="flex-1 overflow-y-auto">
         {activeTab === 'slides' && (
           <ProPresenterSlidesTab
-            activePres={activePres}
+            activePres={displayPres}
             slidesForGrid={slidesForGrid}
             jumpSlide={jumpSlide}
             loading={loading}
@@ -729,9 +891,7 @@ export function ProPresenterRemotePanel() {
         {activeTab === 'macros' && (
           <ProPresenterMacrosTab
             macros={macros}
-            onTriggerMacro={(macroUUID) => {
-              void proPresenterService.triggerMacro(macroUUID)
-            }}
+            onTriggerMacro={handleTriggerMacro}
           />
         )}
 

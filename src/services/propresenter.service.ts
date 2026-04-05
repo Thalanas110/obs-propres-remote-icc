@@ -109,6 +109,11 @@ interface RawPlaylistEntry {
   name?: string
   index?: number
   type?: string
+  target_uuid?: string
+  presentation_info?: {
+    presentation_uuid?: string
+    arrangement_name?: string
+  }
   item?: RawPlaylistEntry
   item_id?: RawPresentationID
   playlist?: RawPlaylistEntry
@@ -133,6 +138,14 @@ interface RawPlaylistContentsResponse {
   results?: RawPlaylistEntry[]
   data?: RawPlaylistEntry[]
   children?: RawPlaylistEntry[]
+}
+
+interface RawVersionResponse {
+  api_version?: string
+  host_description?: string
+  host_platform?: string
+  platform?: string
+  name?: string
 }
 
 export interface Macro {
@@ -182,6 +195,8 @@ class ProPresenterService {
   private _connected = false
   private listeners: Array<() => void> = []
   private pollInterval: ReturnType<typeof setInterval> | null = null
+  private versionPollFailureCount = 0
+  private readonly maxVersionPollFailures = 3
   // Prefer /version first to avoid noisy 404s on newer ProPresenter builds.
   private versionPath: '/v1/version' | '/version' = '/version'
 
@@ -319,7 +334,17 @@ class ProPresenterService {
           signal: AbortSignal.timeout(timeoutMs),
         })
 
-        if (response.ok) {
+        if (!response.ok) {
+          continue
+        }
+
+        const text = await response.text()
+        if (!text) {
+          continue
+        }
+
+        const parsed = this.parseVersionResponse(JSON.parse(text))
+        if (parsed) {
           return true
         }
       } catch {
@@ -445,6 +470,41 @@ class ProPresenterService {
     }
   }
 
+  private parseVersionResponse(value: unknown): {
+    host_description: string
+    host_platform: string
+    api_version: string
+  } | null {
+    if (!value || typeof value !== 'object') return null
+
+    const raw = value as RawVersionResponse
+    const apiVersion = this.normalizeText(raw.api_version)
+    if (!apiVersion) return null
+
+    const hostDescription = this.normalizeText(raw.host_description)
+    const hostName = this.normalizeText(raw.name)
+    if (!hostDescription && !hostName) return null
+
+    const platformCandidate = this.normalizeText(
+      raw.host_platform ?? raw.platform,
+    ).toLowerCase()
+    const hasKnownPlatform =
+      platformCandidate === 'win' ||
+      platformCandidate === 'mac' ||
+      platformCandidate === 'unknown'
+    const hasProPresenterMarker = hostDescription
+      .toLowerCase()
+      .includes('propresenter')
+
+    if (!hasKnownPlatform && !hasProPresenterMarker) return null
+
+    return {
+      host_description: hostDescription || hostName,
+      host_platform: hasKnownPlatform ? platformCandidate : 'unknown',
+      api_version: apiVersion,
+    }
+  }
+
   private async requestVersion(): Promise<{
     host_description: string
     host_platform: string
@@ -457,15 +517,12 @@ class ProPresenterService {
     ]
 
     for (const path of paths) {
-      const result = await this.request<{
-        host_description: string
-        host_platform: string
-        api_version: string
-      }>(path)
+      const result = await this.request<unknown>(path)
+      const parsed = this.parseVersionResponse(result)
 
-      if (result) {
+      if (parsed) {
         this.versionPath = path
-        return result
+        return parsed
       }
     }
 
@@ -480,7 +537,7 @@ class ProPresenterService {
     const normalizedHost =
       host.trim().replace(/^https?:\/\//i, '').replace(/\/$/, '') ||
       'localhost'
-    const candidatePorts = [port, 1025, 50001].filter(
+    const candidatePorts = [port, 50001].filter(
       (value, index, array) => array.indexOf(value) === index,
     )
 
@@ -492,6 +549,7 @@ class ProPresenterService {
       this._port = candidatePort
       const result = await this.requestVersion()
       if (result) {
+        this.versionPollFailureCount = 0
         this._connected = true
         this.notify()
         this.startPolling()
@@ -500,12 +558,14 @@ class ProPresenterService {
     }
 
     this._port = port
+    this.versionPollFailureCount = 0
     this._connected = false
     this.notify()
     return { success: false }
   }
 
   disconnect() {
+    this.versionPollFailureCount = 0
     this._connected = false
     this.stopPolling()
     this.notify()
@@ -513,11 +573,27 @@ class ProPresenterService {
 
   private startPolling() {
     this.stopPolling()
+    this.versionPollFailureCount = 0
     this.pollInterval = setInterval(async () => {
       const result = await this.requestVersion()
-      const wasConnected = this._connected
-      this._connected = result !== null
-      if (wasConnected !== this._connected) {
+      if (result) {
+        this.versionPollFailureCount = 0
+
+        if (!this._connected) {
+          this._connected = true
+          this.notify()
+        }
+
+        return
+      }
+
+      this.versionPollFailureCount += 1
+      if (this.versionPollFailureCount < this.maxVersionPollFailures) {
+        return
+      }
+
+      if (this._connected) {
+        this._connected = false
         this.notify()
       }
     }, 5000)
@@ -535,6 +611,18 @@ class ProPresenterService {
     return value.replace(/\s+/g, ' ').trim()
   }
 
+  private sanitizeUUID(value: unknown): string {
+    const normalized = this.normalizeText(value)
+    if (!normalized) return ''
+
+    const compact = normalized.replace(/[{}-]/g, '').toLowerCase()
+    if (compact.length === 32 && /^0+$/.test(compact)) {
+      return ''
+    }
+
+    return normalized
+  }
+
   private parseIdentifier(value: unknown): RawPresentationID | null {
     if (!value || typeof value !== 'object') return null
 
@@ -544,7 +632,7 @@ class ProPresenterService {
         ? (raw.id as Record<string, unknown>)
         : raw
 
-    const uuid = typeof source.uuid === 'string' ? source.uuid : undefined
+    const uuid = this.sanitizeUUID(source.uuid) || undefined
     const name = typeof source.name === 'string' ? source.name : undefined
     const index =
       typeof source.index === 'number' && Number.isFinite(source.index)
@@ -842,6 +930,38 @@ class ProPresenterService {
         ? (raw.item as Record<string, unknown>)
         : null
 
+    const presentationInfo =
+      raw.presentation_info && typeof raw.presentation_info === 'object'
+        ? (raw.presentation_info as Record<string, unknown>)
+        : null
+
+    const presentationUUIDFromInfo = this.sanitizeUUID(
+      presentationInfo?.presentation_uuid,
+    )
+    const targetUUID = this.sanitizeUUID(raw.target_uuid)
+
+    const fallbackName = this.normalizeText(
+      value.presentation?.id?.name ??
+        value.item?.id?.name ??
+        value.id?.name ??
+        (typeof raw.name === 'string' ? raw.name : ''),
+    )
+    const fallbackIndex = this.parsePlaylistItemIndex(value)
+
+    const buildIdentifierFromUUID = (uuid: string): RawPresentationID => ({
+      uuid,
+      name: fallbackName || undefined,
+      index: typeof fallbackIndex === 'number' ? fallbackIndex : undefined,
+    })
+
+    if (presentationUUIDFromInfo) {
+      return buildIdentifierFromUUID(presentationUUIDFromInfo)
+    }
+
+    if (targetUUID) {
+      return buildIdentifierFromUUID(targetUUID)
+    }
+
     return (
       this.parseIdentifier(value.presentation?.id) ??
       this.parseIdentifier(value.presentation_id) ??
@@ -951,12 +1071,15 @@ class ProPresenterService {
     quality = 360,
     thumbnailType: 'jpeg' | 'png' = 'jpeg',
   ): string {
+    const targetUUID = this.sanitizeUUID(presentationUUID)
+    if (!targetUUID) return 'about:blank'
+
     const params = new URLSearchParams()
     params.set('quality', `${Math.max(64, Math.floor(quality))}`)
     params.set('thumbnail_type', thumbnailType)
 
     return `${this.baseUrl}/v1/presentation/${encodeURIComponent(
-      presentationUUID,
+      targetUUID,
     )}/thumbnail/${slideIndex}?${params.toString()}`
   }
 
@@ -969,13 +1092,14 @@ class ProPresenterService {
 
     const presentation = result.presentation ?? result
     const id = presentation.id ?? {}
+    const presentationUUID = this.sanitizeUUID(id.uuid)
     let slides = this.parsePresentationSlides(presentation)
 
     // Some builds return a compact active payload. Hydrate slide text/details from
     // the full presentation endpoint when active data does not include slide items.
-    if (slides.length === 0 && typeof id.uuid === 'string' && id.uuid.length > 0) {
+    if (slides.length === 0 && presentationUUID) {
       const detailedPresentation = await this.request<RawPresentation>(
-        `/v1/presentation/${id.uuid}`,
+        `/v1/presentation/${presentationUUID}`,
       )
 
       if (detailedPresentation) {
@@ -1031,7 +1155,7 @@ class ProPresenterService {
 
     return {
       id: {
-        uuid: id.uuid ?? '',
+        uuid: presentationUUID,
         name: id.name ?? 'Unknown',
         index: typeof id.index === 'number' ? id.index : 0,
       },
@@ -1045,6 +1169,42 @@ class ProPresenterService {
           : 0,
       slides,
       statusCurrentSlideUUID: statusSlideUUID,
+    }
+  }
+
+  async getPresentationByUUID(
+    presentationUUID: string,
+  ): Promise<ActivePresentation | null> {
+    const targetUUID = this.sanitizeUUID(presentationUUID)
+    if (!targetUUID) return null
+
+    const presentation = await this.request<RawPresentation>(
+      `/v1/presentation/${encodeURIComponent(targetUUID)}`,
+    )
+    if (!presentation) return null
+
+    const id = presentation.id ?? {}
+    const slides = this.parsePresentationSlides(presentation)
+
+    const totalSlidesCandidate =
+      presentation.presentationSlideCount ??
+      presentation.presentation_slide_count ??
+      slides.length
+
+    return {
+      id: {
+        uuid: this.sanitizeUUID(id.uuid) || targetUUID,
+        name: id.name ?? 'Unknown',
+        index: typeof id.index === 'number' ? id.index : 0,
+      },
+      // Focused presentation is staged/preview-only until an explicit slide trigger.
+      presentationCurrentSlide: -1,
+      presentationSlideCount:
+        typeof totalSlidesCandidate === 'number' &&
+        Number.isFinite(totalSlidesCandidate)
+          ? Math.max(totalSlidesCandidate, 0)
+          : slides.length,
+      slides,
     }
   }
 
@@ -1082,7 +1242,7 @@ class ProPresenterService {
     presentationUUID: string,
     slideIndex: number,
   ): Promise<boolean> {
-    const targetUUID = presentationUUID.trim()
+    const targetUUID = this.sanitizeUUID(presentationUUID)
     const normalizedIndex = Math.max(Math.floor(slideIndex), 0)
     const indexCandidates =
       normalizedIndex === 0
@@ -1094,10 +1254,6 @@ class ProPresenterService {
     indexCandidates.forEach((index) => {
       const encodedIndex = encodeURIComponent(`${index}`)
 
-      // API-documented cue trigger routes for active/focused presentation.
-      paths.push(`/v1/presentation/active/${encodedIndex}/trigger`)
-      paths.push(`/v1/presentation/focused/${encodedIndex}/trigger`)
-
       if (targetUUID) {
         const encodedUUID = encodeURIComponent(targetUUID)
 
@@ -1105,6 +1261,11 @@ class ProPresenterService {
         paths.push(`/v1/presentation/${encodedUUID}/${encodedIndex}/trigger`)
         paths.push(`/v1/presentation/${encodedUUID}/trigger/${encodedIndex}`)
       }
+
+      // Focused route lets us stage then manually choose first live slide.
+      paths.push(`/v1/presentation/focused/${encodedIndex}/trigger`)
+      // Active route remains as fallback for builds that don't support focused cues.
+      paths.push(`/v1/presentation/active/${encodedIndex}/trigger`)
     })
 
     const uniquePaths = Array.from(new Set(paths))
@@ -1187,11 +1348,31 @@ class ProPresenterService {
   }
 
   async triggerPresentation(presentationUUID: string): Promise<boolean> {
-    const target = presentationUUID.trim()
+    const target = this.sanitizeUUID(presentationUUID)
     if (!target) return false
 
     return this.requestOk(
       `/v1/presentation/${encodeURIComponent(target)}/trigger`,
+      'GET',
+    )
+  }
+
+  async focusPresentation(presentationUUID: string): Promise<boolean> {
+    const target = this.sanitizeUUID(presentationUUID)
+    if (!target) return false
+
+    return this.requestOk(
+      `/v1/presentation/${encodeURIComponent(target)}/focus`,
+      'GET',
+    )
+  }
+
+  async focusPlaylist(playlistUUID: string): Promise<boolean> {
+    const target = playlistUUID.trim()
+    if (!target) return false
+
+    return this.requestOk(
+      `/v1/playlist/${encodeURIComponent(target)}/focus`,
       'GET',
     )
   }
@@ -1275,7 +1456,6 @@ class ProPresenterService {
   // ── Playlists ───────────────────────────────────────────────────────────────
   async getPlaylists(): Promise<PlaylistItem[]> {
     const items = await this.requestPlaylistEntries([
-      '/v1/playlist/identifiers',
       '/v1/playlists',
       '/v1/playlist',
     ])
