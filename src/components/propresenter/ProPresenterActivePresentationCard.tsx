@@ -50,6 +50,17 @@ export function ProPresenterActivePresentationCard({
   onRefreshPresentationOptions,
 }: ProPresenterActivePresentationCardProps) {
   const isPlaylistSource = source === 'playlist'
+  const getPlaylistItemValue = (item: PlaylistPresentation) => {
+    const playlistUUID = item.playlist.uuid.trim()
+    const playlistName = item.playlist.name.trim()
+    const playlistKey =
+      playlistUUID || (playlistName ? `${playlistName}::${item.playlist.index}` : `${item.playlist.index}`)
+
+    const itemUUID = item.item.uuid.trim()
+    const itemName = item.item.name.trim()
+
+    return itemUUID ? `${playlistKey}::${itemUUID}` : `${playlistKey}::${itemName || item.item.index}`
+  }
   const playlistOptionsCount = playlistOptions.length
   const disablePlaylistSelect =
     refreshingPresentationList || switchingPresentation || playlistOptionsCount === 0
@@ -213,7 +224,7 @@ export function ProPresenterActivePresentationCard({
                     ? playlistPresentations.map((item) => (
                         <SelectItem
                           key={`${item.playlist.uuid || item.playlist.name}-${item.item.uuid}`}
-                          value={`${item.playlist.uuid}::${item.item.uuid}`}
+                          value={getPlaylistItemValue(item)}
                           className="text-xs focus:bg-violet-500/20 focus:text-violet-100"
                         >
                           {`${item.presentation?.name || item.item.name} (${item.playlist.name})`}

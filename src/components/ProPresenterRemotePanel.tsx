@@ -469,6 +469,46 @@ export function ProPresenterRemotePanel() {
   }, [filteredPlaylistPresentations, activePres?.uuid])
 
   useEffect(() => {
+    if (!selectedPlaylistItemKey || !proPresenterService.status.connected) return
+    if (presentationSource !== 'playlist') return
+
+    const selectedItem = filteredPlaylistPresentations.find(
+      (item) => getPlaylistItemKey(item) === selectedPlaylistItemKey,
+    )
+    if (!selectedItem) return
+
+    const selectedName =
+      selectedItem.presentation?.name?.trim() ||
+      selectedItem.item.name?.trim() ||
+      'Unknown'
+    const previewUUID =
+      selectedItem.presentation?.uuid?.trim() ||
+      selectedItem.item?.uuid?.trim() ||
+      ''
+
+    const fallbackPreview: ActivePres = {
+      name: selectedName,
+      currentSlide: -1,
+      totalSlides: 1,
+      uuid: previewUUID || selectedItem.item.uuid || '',
+      slides: [
+        {
+          uuid: `${previewUUID || selectedItem.item.uuid || selectedName}::preview`,
+          index: 0,
+          label: selectedName,
+          text: selectedName,
+          notes: '',
+          groupName: 'Selected (not live)',
+        },
+      ],
+      statusCurrentSlideUUID: undefined,
+    }
+
+    setStagedPres(fallbackPreview)
+    setActiveTab('slides')
+  }, [selectedPlaylistItemKey, filteredPlaylistPresentations, presentationSource])
+
+  useEffect(() => {
     if (libraryPresentations.length === 0) {
       setSelectedLibraryPresentationUUID('')
       return
@@ -496,6 +536,38 @@ export function ProPresenterRemotePanel() {
       return libraryPresentations[0]?.presentation.uuid ?? ''
     })
   }, [libraryPresentations, activePres?.uuid])
+
+  useEffect(() => {
+    if (!selectedLibraryPresentationUUID || !proPresenterService.status.connected) return
+    if (presentationSource !== 'library') return
+
+    const previewUUID = selectedLibraryPresentationUUID.trim()
+    if (!previewUUID) return
+
+    const selectedLibraryPresentation = libraryPresentations.find(
+      (item) => item.presentation.uuid === previewUUID,
+    )
+    const fallbackPreview: ActivePres = {
+      name: selectedLibraryPresentation?.presentation.name || 'Unknown',
+      currentSlide: -1,
+      totalSlides: 1,
+      uuid: previewUUID,
+      slides: [
+        {
+          uuid: `${previewUUID || selectedLibraryPresentation?.presentation.name || 'library'}::preview`,
+          index: 0,
+          label: selectedLibraryPresentation?.presentation.name || 'Selected',
+          text: selectedLibraryPresentation?.presentation.name || 'Selected',
+          notes: '',
+          groupName: 'Selected (not live)',
+        },
+      ],
+      statusCurrentSlideUUID: undefined,
+    }
+
+    setStagedPres(fallbackPreview)
+    setActiveTab('slides')
+  }, [selectedLibraryPresentationUUID, presentationSource, libraryPresentations])
 
   const triggerSlideByIndex = (slideIndex: number) => {
     const presentationUUID = displayPres?.uuid
